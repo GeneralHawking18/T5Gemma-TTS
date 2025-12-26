@@ -1,0 +1,41 @@
+[project]
+name = "t5gemma-tts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bitsandbytes>=0.49.0",
+    "datasets<4",
+    "dotenv>=0.9.9",
+    "einops>=0.8.0",
+    "ffmpeg-python>=0.2.0",
+    "fire>=0.7.1",
+    "g2p-en>=2.1.0",
+    "gradio>=6.2.0",
+    "huggingface-hub>=0.36.0",
+    "langdetect>=1.0.9",
+    "librosa>=0.11.0",
+    "matplotlib>=3.10.8",
+    "numba>=0.60.0",
+    "numpy>=2.2.6",
+    "omegaconf==2.3.0",
+    "peft>=0.12.0",
+    "pyopenjtalk-plus[onnxruntime]>=0.4.1.post7",
+    "pypinyin>=0.55.0",
+    "scipy>=1.15.3",
+    "sentencepiece>=0.2.1",
+    "soundfile>=0.13.1",
+    "tensorboard>=2.20.0",
+    "torch>=2.5.1,<=2.8.0",
+    "torchaudio>=2.5.1,<=2.8.0",
+    "torchcodec>=0.9.1",
+    "torchmetrics>=1.8.2",
+    "tqdm>=4.67.1",
+    "transformers==4.57.3",
+    "wandb>=0.23.1",
+    "xcodec2",
+]
+
+[tool.uv.sources]
+xcodec2 = { url = "https://huggingface.co/NandemoGHS/Anime-XCodec2-44.1kHz-v2/resolve/main/xcodec2-0.1.7.tar.gz" }
