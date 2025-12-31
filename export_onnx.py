@@ -1,461 +1,470 @@
 #!/usr/bin/env python3
 """
-Export T5Gemma-TTS model to ONNX format for CPU inference.
+Unified ONNX Export & Quantization Script for T5Gemma-TTS.
 
-This script exports the model in two parts:
-1. Encoder - encodes text to memory states
-2. Decoder - generates audio tokens step-by-step with KV cache
+Features:
+- Exports Encoder, Decoder (Init & Step), and XCodec2
+- Handles FP32 export for stable quantization
+- Performs INT8 Dynamic Quantization
+- CPU-Optimized execution
 
 Usage:
-    python export_onnx.py \
-        --model_name bundle_step64000_infer \
-        --model_root . \
-        --output_dir ./onnx_models
+    python export_onnx.py --model_name "Aratako/T5Gemma-TTS-2b-2b"
 """
 
+# =============================================================================
+# CRITICAL: Set TMPDIR BEFORE any imports to avoid "No space left on device"
+# The system /tmp is on the root partition (98% full, only 6GB free).
+# We redirect all temp files to the HDD which has 31GB+ free.
+# =============================================================================
 import os
+_SAFE_TMPDIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "temp_working"))
+os.makedirs(_SAFE_TMPDIR, exist_ok=True)
+os.environ["TMPDIR"] = _SAFE_TMPDIR
+os.environ["TEMP"] = _SAFE_TMPDIR  # Windows compatibility
+os.environ["TMP"] = _SAFE_TMPDIR   # Windows compatibility
+import tempfile
+tempfile.tempdir = _SAFE_TMPDIR  # Force Python's tempfile module to use it
+print(f"[INIT] TMPDIR set to: {_SAFE_TMPDIR}")
+
+import gc
+import json
+import shutil
+import logging
+import traceback
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+
 import torch
 import torch.nn as nn
-from argparse import Namespace
-from typing import Dict, Optional, Tuple
-import logging
+from transformers import AutoModelForSeq2SeqLM
 
+# Local modules
+from onnx_modules import (
+    EncoderWrapper, 
+    DecoderInitWrapper, 
+    DecoderStepWrapper, 
+    XCodec2DecoderWrapper
+)
+
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
-############################################################
-# Wrapper modules for ONNX export
-############################################################
+# =============================================================================
+# Monkeypatch for ONNX compatibility (SDPA)
+# =============================================================================
+def _apply_sdpa_monkeypatch() -> None:
+    import transformers.masking_utils
+    def _custom_no_vmap_sdpa_mask(batch_size, cache_position, kv_length, kv_offset=0, mask_function=None, attention_mask=None, **kwargs):
+        device = cache_position.device
+        q_length = cache_position.shape[0]
+        query_idx = cache_position.unsqueeze(1)
+        key_idx = torch.arange(kv_length, device=device).unsqueeze(0) + kv_offset
+        causal_mask = query_idx >= key_idx
+        causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+        if attention_mask is not None:
+            padding_mask = attention_mask.to(torch.bool)[:, None, None, :]
+            causal_mask = causal_mask & padding_mask
+        return causal_mask
 
-class EncoderWrapper(nn.Module):
-    """Wrapper for the encoder part of T5Gemma for ONNX export."""
+    transformers.masking_utils.sdpa_mask = _custom_no_vmap_sdpa_mask
+    transformers.masking_utils.sdpa_mask_recent_torch = _custom_no_vmap_sdpa_mask
+    transformers.masking_utils.sdpa_mask_older_torch = _custom_no_vmap_sdpa_mask
     
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self.encoder = model.encoder_module
-        self.text_input_type = model.text_input_type
-        self.text_embedding = model.text_embedding
-        self.text_dropout = model.text_dropout
-        self.progress_scale = model.progress_scale
-        
-    def _build_position_ids(self, x_lens: torch.Tensor, max_len: int, device) -> torch.Tensor:
-        """Build PM-RoPE position IDs."""
-        lengths = x_lens.to(device=device)
-        pos = torch.arange(max_len, device=device, dtype=torch.float32)[None, :]
-        denom = (lengths.clamp(min=2).to(torch.float32) - 1.0)[:, None]
-        position_ids = pos / denom * self.progress_scale
-        mask = pos < lengths[:, None]
-        return position_ids.masked_fill(~mask, 0.0)
-    
-    def forward(
-        self, 
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            input_ids: [batch, seq_len] - tokenized text
-            attention_mask: [batch, seq_len] - 1 for valid tokens, 0 for padding
+    # Also patch the global mapping which captures the function references
+    if hasattr(transformers.masking_utils, "ALL_MASK_ATTENTION_FUNCTIONS"):
+        mapping = transformers.masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping
+        if "sdpa" in mapping:
+            mapping["sdpa"] = _custom_no_vmap_sdpa_mask
             
-        Returns:
-            encoder_hidden_states: [batch, seq_len, hidden_size]
-        """
-        x_lens = attention_mask.sum(dim=1)
-        use_pm_rope = getattr(self.model.args, "use_pm_rope", 1)
+    logger.info("Monkeypatched transformers.masking_utils.sdpa_mask")
+
+_apply_sdpa_monkeypatch()
+
+# =============================================================================
+# Exporter Config & Logic
+# =============================================================================
+
+@dataclass
+class ExportConfig:
+    model_name: str = "Aratako/T5Gemma-TTS-2b-2b"
+    output_dir: str = "./onnx_models"
+    opset_version: int = 17
+    # User requested fp16
+    export_dtype: torch.dtype = torch.float16 
+    device: str = "cpu"
+
+class T5GemmaExporter:
+    def __init__(self, config: ExportConfig):
+        self.config = config
+        self.model = None
+
+    def load_model(self):
+        logger.info(f"Loading model: {self.config.model_name} (forcing {self.config.export_dtype})")
         
-        if use_pm_rope:
-            position_ids = self._build_position_ids(x_lens, input_ids.shape[1], input_ids.device)
-        else:
-            position_ids = None
-            
-        if self.text_input_type == "text":
-            encoder_outputs = self.encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+        try:
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.config.model_name,
+                trust_remote_code=True,
+                torch_dtype=self.config.export_dtype,
+                low_cpu_mem_usage=True,
+                device_map={"": self.config.device},
             )
-        else:
-            x_embeds = self.text_dropout(self.text_embedding(input_ids))
-            encoder_outputs = self.encoder(
-                inputs_embeds=x_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
+            self.model.eval()
             
-        return encoder_outputs.last_hidden_state
-
-
-class DecoderInitWrapper(nn.Module):
-    """Wrapper for initial decoder pass (process prompt and get initial KV cache)."""
-    
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self.decoder = model.decoder_module
-        self.audio_embedding = model.audio_embedding[0]
-        self.audio_dropout = model.audio_dropout
-        self.predict_layer = model.predict_layer[0]
-        self.progress_scale = model.progress_scale
-        self.args = model.args
-        
-    def forward(
-        self,
-        prompt_tokens: torch.Tensor,  # [batch, prompt_len]
-        encoder_hidden_states: torch.Tensor,  # [batch, enc_len, hidden]
-        encoder_attention_mask: torch.Tensor,  # [batch, enc_len]
-        target_length: torch.Tensor,  # [batch] - estimated total length
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
-        Process audio prompt and return initial KV cache.
-        
-        Returns:
-            logits: [batch, 1, vocab_size] - logits for next token
-            past_key_values: tuple of KV cache tensors
-        """
-        batch_size = prompt_tokens.shape[0]
-        device = prompt_tokens.device
-        
-        # Prepend BOS token
-        bos = torch.full(
-            (batch_size, 1),
-            self.args.empty_token,
-            dtype=torch.long,
-            device=device,
-        )
-        tokens = torch.cat([bos, prompt_tokens], dim=1)  # [B, T+1]
-        
-        # Embed audio tokens
-        embedded_y = self.audio_embedding(tokens)
-        embedded_y = self.audio_dropout(embedded_y)
-        
-        cur_len = embedded_y.shape[1]
-        decoder_attention_mask = torch.ones(
-            (batch_size, cur_len), dtype=torch.long, device=device
-        )
-        
-        # Build PM-RoPE position ids
-        use_pm_rope = getattr(self.args, "use_pm_rope", 1)
-        pm_kwargs = {}
-        
-        if use_pm_rope:
-            x_lens = encoder_attention_mask.sum(dim=1)
-            max_len = encoder_hidden_states.shape[1]
-            enc_pos = torch.arange(max_len, device=device, dtype=torch.float32)[None, :]
-            denom = (x_lens.clamp(min=2).to(torch.float32) - 1.0)[:, None]
-            encoder_position_ids = enc_pos / denom * self.progress_scale
-            mask = enc_pos < x_lens[:, None]
-            encoder_position_ids = encoder_position_ids.masked_fill(~mask, 0.0)
+            # Additional force cast
+            self.model.to(dtype=self.config.export_dtype)
             
-            # Decoder position ids
-            est_total = target_length.float() + 1  # account for BOS
-            base = torch.arange(cur_len, device=device, dtype=torch.float32).unsqueeze(0)
-            decoder_position_ids = base / (est_total[:, None].clamp(min=2) - 1) * self.progress_scale
+            # Setup compatibility attributes
+            if not hasattr(self.model, "args"):
+                self.model.args = self.model.config
+            if not hasattr(self.model, "encoder_module"):
+                if hasattr(self.model, "model"):
+                    self.model.encoder_module = self.model.model.encoder
+                    self.model.decoder_module = self.model.model.decoder
+            if not hasattr(self.model, "text_input_type"):
+                self.model.text_input_type = getattr(self.model.config, "text_input_type", "text")
+            if not hasattr(self.model, "progress_scale"):
+                self.model.progress_scale = getattr(self.model.config, "progress_scale", 2000.0)
+                
+            logger.info("Model loaded successfully.")
             
-            pm_kwargs["position_ids"] = decoder_position_ids
-            pm_kwargs["pm_decoder_position_ids"] = decoder_position_ids
-            pm_kwargs["pm_encoder_position_ids"] = encoder_position_ids
-        else:
-            pm_kwargs["position_ids"] = None
-            
-        # Run decoder
-        decoder_outputs = self.decoder(
-            inputs_embeds=embedded_y,
-            attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=True,
-            **pm_kwargs,
-        )
-        
-        # Get logits for next token prediction
-        last_hidden = decoder_outputs.last_hidden_state[:, -1:, :]
-        logits = self.predict_layer(last_hidden)
-        
-        return logits, decoder_outputs.past_key_values
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
 
-
-class DecoderStepWrapper(nn.Module):
-    """Wrapper for single decoder step with KV cache."""
-    
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self.decoder = model.decoder_module
-        self.audio_embedding = model.audio_embedding[0]
-        self.audio_dropout = model.audio_dropout
-        self.predict_layer = model.predict_layer[0]
-        self.progress_scale = model.progress_scale
-        self.args = model.args
+    def export_all(self):
+        os.makedirs(self.config.output_dir, exist_ok=True)
         
-    def forward(
-        self,
-        input_token: torch.Tensor,  # [batch, 1]
-        encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor,
-        current_length: torch.Tensor,  # [batch] - current sequence length
-        target_length: torch.Tensor,  # [batch] - estimated total length
-        past_key_values: Tuple[torch.Tensor, ...],
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
-        Single autoregressive step.
-        
-        Returns:
-            logits: [batch, 1, vocab_size]
-            new_past_key_values: updated KV cache
-        """
-        device = input_token.device
-        batch_size = input_token.shape[0]
-        
-        # Embed single token
-        embedded = self.audio_embedding(input_token)
-        embedded = self.audio_dropout(embedded)
-        
-        # Full attention mask covering all seen tokens
-        attention_mask = torch.ones(
-            (batch_size, current_length[0].item() + 1),
-            dtype=torch.long,
-            device=device
-        )
-        
-        # Build position ids
-        use_pm_rope = getattr(self.args, "use_pm_rope", 1)
-        pm_kwargs = {}
-        
-        if use_pm_rope:
-            x_lens = encoder_attention_mask.sum(dim=1)
-            max_len = encoder_hidden_states.shape[1]
-            enc_pos = torch.arange(max_len, device=device, dtype=torch.float32)[None, :]
-            denom = (x_lens.clamp(min=2).to(torch.float32) - 1.0)[:, None]
-            encoder_position_ids = enc_pos / denom * self.progress_scale
-            mask = enc_pos < x_lens[:, None]
-            encoder_position_ids = encoder_position_ids.masked_fill(~mask, 0.0)
-            
-            # Single position for this step
-            cur_len = current_length.float()
-            est_total = target_length.float() + 1
-            new_pos_value = cur_len / (est_total.clamp(min=2) - 1) * self.progress_scale
-            new_pos_value = new_pos_value.clamp(max=self.progress_scale)
-            pos_1 = new_pos_value.unsqueeze(-1)  # [B, 1]
-            
-            pm_kwargs["position_ids"] = pos_1
-            pm_kwargs["pm_decoder_position_ids"] = pos_1
-            pm_kwargs["pm_encoder_position_ids"] = encoder_position_ids
-        else:
-            pm_kwargs["position_ids"] = None
-            
-        decoder_outputs = self.decoder(
-            inputs_embeds=embedded,
-            attention_mask=attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
-            **pm_kwargs,
-        )
-        
-        logits = self.predict_layer(decoder_outputs.last_hidden_state)
-        
-        return logits, decoder_outputs.past_key_values
-
-
-############################################################
-# Export functions
-############################################################
-
-def export_encoder(
-    model,
-    output_path: str,
-    opset_version: int = 17,
-):
-    """Export encoder to ONNX."""
-    logging.info("Exporting encoder to ONNX...")
-    
-    encoder_wrapper = EncoderWrapper(model)
-    encoder_wrapper.eval()
-    
-    # Sample inputs
-    batch_size = 1
-    seq_len = 64
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-    
-    dummy_input_ids = torch.randint(0, 1000, (batch_size, seq_len), device=device)
-    dummy_attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
-    
-    # Export
-    torch.onnx.export(
-        encoder_wrapper,
-        (dummy_input_ids, dummy_attention_mask),
-        output_path,
-        export_params=True,
-        opset_version=opset_version,
-        do_constant_folding=True,
-        input_names=['input_ids', 'attention_mask'],
-        output_names=['encoder_hidden_states'],
-        dynamic_axes={
-            'input_ids': {0: 'batch', 1: 'sequence'},
-            'attention_mask': {0: 'batch', 1: 'sequence'},
-            'encoder_hidden_states': {0: 'batch', 1: 'sequence'},
-        },
-    )
-    
-    logging.info(f"Encoder exported to {output_path}")
-
-
-def export_xcodec2(
-    audio_tokenizer,
-    output_dir: str,
-    opset_version: int = 17,
-):
-    """Export XCodec2 encoder and decoder to ONNX."""
-    logging.info("Exporting XCodec2 audio tokenizer...")
-    
-    device = audio_tokenizer.device
-    
-    # Export encoder (audio -> codes)
-    class XCodec2Encoder(nn.Module):
-        def __init__(self, codec):
-            super().__init__()
-            self.codec = codec
-            self.sample_rate = codec.config.encoder_sample_rate if hasattr(codec.config, 'encoder_sample_rate') else 16000
-            
-        def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-            # waveform: [batch, samples]
-            codes = self.codec.encode_code(input_waveform=waveform, sample_rate=self.sample_rate)
-            return codes
-    
-    # Export decoder (codes -> audio)
-    class XCodec2Decoder(nn.Module):
-        def __init__(self, codec):
-            super().__init__()
-            self.codec = codec
-            
-        def forward(self, codes: torch.Tensor) -> torch.Tensor:
-            # codes: [batch, num_codes] or [batch, 1, num_codes]
-            if codes.ndim == 2:
-                codes = codes.unsqueeze(1)
-            codes = codes.long()
-            recon = self.codec.decode_code(codes)
-            return recon
-    
-    # Export decoder only (usually what we need for inference)
-    decoder_wrapper = XCodec2Decoder(audio_tokenizer.codec)
-    decoder_wrapper.eval()
-    
-    dummy_codes = torch.randint(0, 65535, (1, 1, 100), device=device, dtype=torch.long)
-    
-    decoder_path = os.path.join(output_dir, "xcodec2_decoder.onnx")
-    
-    try:
-        torch.onnx.export(
-            decoder_wrapper,
-            dummy_codes,
-            decoder_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['codes'],
-            output_names=['audio'],
+        # 1. Export Encoder
+        self._export_component(
+            name="encoder",
+            wrapper_cls=EncoderWrapper,
+            dummy_inputs=self._get_encoder_dummies(),
+            input_names=['input_ids', 'attention_mask'],
+            output_names=['encoder_hidden_states'],
             dynamic_axes={
-                'codes': {0: 'batch', 2: 'num_codes'},
-                'audio': {0: 'batch', 1: 'samples'},
-            },
+                'input_ids': {0: 'batch', 1: 'sequence'},
+                'attention_mask': {0: 'batch', 1: 'sequence'},
+                'encoder_hidden_states': {0: 'batch', 1: 'sequence'},
+            }
         )
-        logging.info(f"XCodec2 decoder exported to {decoder_path}")
-    except Exception as e:
-        logging.warning(f"Failed to export XCodec2: {e}")
-        logging.warning("You may need to use the original XCodec2 for audio decoding.")
+        
+        # 2. Export Decoder Init - DISABLED for hybrid inference
+        # Decoder uses PyTorch for better FP16 stability and memory efficiency
+        logger.info("Skipping decoder_init export for Hybrid Inference (using PyTorch for decoding).")
+        # self._export_component(
+        #     name="decoder_init",
+        #     wrapper_cls=DecoderInitWrapper,
+        #     dummy_inputs=self._get_decoder_init_dummies(),
+        #     input_names=['prompt_tokens', 'encoder_hidden_states', 'encoder_attention_mask', 'target_length'],
+        #     output_names=['logits'],
+        #     dynamic_axes={
+        #         'prompt_tokens': {0: 'batch', 1: 'prompt_length'},
+        #         'encoder_hidden_states': {0: 'batch', 1: 'enc_length'},
+        #         'encoder_attention_mask': {0: 'batch', 1: 'enc_length'},
+        #         'logits': {0: 'batch'},
+        #     }
+        # )
+        
+        # 3. Export Decoder Step - SKIPPED FOR HYBRID INFERENCE
+        # T5Gemma's complex cache with cross-attention is not compatible with legacy ONNX.
+        # We will use PyTorch for the autoregressive decoder step.
+        logger.info("Skipping decoder_step export for Hybrid Inference (using PyTorch for decoding).")
 
+        # 4. Export XCodec2 - SKIPPED FOR HYBRID INFERENCE
+        # XCodec2 export has issues with einx/dynamic shapes. Using PyTorch.
+        logger.info("Skipping XCodec2 export for Hybrid Inference (using PyTorch).")
+        
+        # 5. Save Config
+        self._save_config()
 
-############################################################
-# Main export script
-############################################################
+    def _export_component(self, name, wrapper_cls, dummy_inputs, **kwargs):
+        output_path = os.path.join(self.config.output_dir, f"{name}.onnx")
+        
+        # Skip if ONNX file already exists
+        if os.path.exists(output_path):
+            logger.info(f"Skipping {name} - already exists at {output_path}")
+            return
+        
+        logger.info(f"Exporting {name} to {output_path}...")
+        
+        wrapper = wrapper_cls(self.model)
+        wrapper.eval()
+        
+        torch.onnx.export(
+            wrapper,
+            dummy_inputs,
+            output_path,
+            export_params=True,
+            opset_version=self.config.opset_version,
+            do_constant_folding=True,
+            **kwargs
+        )
+        logger.info(f"Exported {name}.")
 
-def main(
-    model_name: str = "bundle_step64000_infer",
-    model_root: str = ".",
-    output_dir: str = "./onnx_models",
-    opset_version: int = 17,
-    export_audio_codec: bool = True,
-):
-    """
-    Export T5Gemma-TTS model to ONNX.
-    
-    Args:
-        model_name: Name of the model bundle (without .pth)
-        model_root: Directory containing the model bundle
-        output_dir: Directory to save ONNX models
-        opset_version: ONNX opset version
-        export_audio_codec: Whether to also export XCodec2
-    """
-    import fire
-    
+    def _get_encoder_dummies(self):
+        device = self.config.device
+        return (
+            torch.randint(0, 1000, (1, 64), device=device, dtype=torch.long),
+            torch.ones((1, 64), dtype=torch.long, device=device)
+        )
+
+    def _get_decoder_init_dummies(self):
+        device = self.config.device
+        dtype = self.config.export_dtype
+        batch, prompt_len, enc_len = 1, 10, 64
+        enc_hidden = getattr(self.model.config, "encoder_hidden_size", 2304)
+        
+        return (
+            torch.randint(0, 100, (batch, prompt_len), device=device, dtype=torch.long),
+            torch.randn(batch, enc_len, enc_hidden, device=device, dtype=dtype),
+            torch.ones(batch, enc_len, device=device, dtype=torch.long),
+            torch.tensor([50], device=device, dtype=torch.long)
+        )
+
+    def _export_decoder_step(self):
+        name = "decoder_step"
+        output_path = os.path.join(self.config.output_dir, f"{name}.onnx")
+        
+        # Skip if ONNX file already exists
+        if os.path.exists(output_path):
+            logger.info(f"Skipping {name} - already exists at {output_path}")
+            return
+        
+        logger.info(f"Exporting {name} to {output_path}...")
+        
+        wrapper = DecoderStepWrapper(self.model)
+        wrapper.eval()
+        
+        # Prepare complex dummy inputs for KV cache
+        config = self.model.config
+        batch = 1
+        # T5GemmaVoiceConfig has nested decoder config
+        decoder_config = getattr(config, "decoder", config)
+        num_layers = getattr(decoder_config, "num_hidden_layers", 26)
+        num_heads = getattr(decoder_config, "num_key_value_heads", 4)
+        head_dim = getattr(decoder_config, "head_dim", 256)
+        past_seq = 10
+        device = self.config.device
+        dtype = self.config.export_dtype
+        
+        input_token = torch.tensor([[1]], device=device, dtype=torch.long)
+        enc_len = 64
+        enc_hidden = getattr(config, "encoder_hidden_size", 2304)
+        
+        encoder_hidden = torch.randn(batch, enc_len, enc_hidden, device=device, dtype=dtype)
+        encoder_mask = torch.ones(batch, enc_len, device=device, dtype=torch.long)
+        cur_len = torch.tensor([past_seq], device=device, dtype=torch.long)
+        tgt_len = torch.tensor([50], device=device, dtype=torch.long)
+        
+        past_key_values = []
+        for _ in range(num_layers):
+            k = torch.randn(batch, num_heads, past_seq, head_dim, device=device, dtype=dtype)
+            v = torch.randn(batch, num_heads, past_seq, head_dim, device=device, dtype=dtype)
+            past_key_values.append(k)
+            past_key_values.append(v)
+            
+        dummies = (input_token, encoder_hidden, encoder_mask, cur_len, tgt_len, tuple(past_key_values))
+        
+        # Dynamic Axes
+        input_names = ['input_token', 'encoder_hidden_states', 'encoder_attention_mask', 'current_length', 'target_length']
+        output_names = ['logits']
+        dynamic_axes = {
+            'input_token': {0: 'batch'},
+            'encoder_hidden_states': {0: 'batch', 1: 'enc_len'},
+            'encoder_attention_mask': {0: 'batch', 1: 'enc_len'},
+            'logits': {0: 'batch'},
+        }
+        
+        # KV Names
+        pv_names = []
+        for i in range(num_layers):
+            k_name, v_name = f'past_key_values.{i}.key', f'past_key_values.{i}.value'
+            input_names.extend([k_name, v_name])
+            dynamic_axes[k_name] = {0: 'batch', 2: 'past_len'}
+            dynamic_axes[v_name] = {0: 'batch', 2: 'past_len'}
+            
+            pk_name, pv_name = f'present_key_values.{i}.key', f'present_key_values.{i}.value'
+            pv_names.extend([pk_name, pv_name])
+            dynamic_axes[pk_name] = {0: 'batch', 2: 'pres_len'}
+            dynamic_axes[pv_name] = {0: 'batch', 2: 'pres_len'}
+            
+        output_names.extend(pv_names)
+        
+        torch.onnx.export(
+            wrapper, dummies, output_path,
+            export_params=True, opset_version=self.config.opset_version,
+            do_constant_folding=True,
+            input_names=input_names, output_names=output_names,
+            dynamic_axes=dynamic_axes
+        )
+        logger.info(f"Exported {name}.")
+
+    def _export_xcodec2(self):
+        try:
+            from data.tokenizer import AudioTokenizer
+            name = "xcodec2_decoder"
+            output_path = os.path.join(self.config.output_dir, f"{name}.onnx")
+            
+            # Skip if ONNX file already exists
+            if os.path.exists(output_path):
+                logger.info(f"Skipping {name} - already exists at {output_path}")
+                return
+            
+            logger.info(f"Exporting {name}...")
+            
+            xcodec_name = getattr(self.model.config, "xcodec2_model_name", "hkust-audio/xcodec2")
+            tok = AudioTokenizer(backend="xcodec2", model_name=xcodec_name, device=self.config.device)
+            
+            wrapper = XCodec2DecoderWrapper(tok.codec)
+            wrapper.eval()
+            
+            dummy = torch.randint(0, 65535, (1, 1, 100), device=self.config.device, dtype=torch.long)
+            
+            torch.onnx.export(
+                wrapper, dummy, output_path,
+                export_params=True, opset_version=self.config.opset_version,
+                do_constant_folding=True,
+                input_names=['codes'], output_names=['audio'],
+                dynamic_axes={'codes': {0: 'batch', 2: 'num_codes'}, 'audio': {0: 'batch', 1: 'samples'}}
+            )
+            logger.info(f"Exported {name}.")
+        except Exception as e:
+            logger.warning(f"Skipping XCodec2 export: {e}")
+
+    def _save_config(self):
+        path = os.path.join(self.config.output_dir, "model_args.json")
+        # Get config - handle various attribute structures
+        conf_obj = self.model.config
+        if hasattr(conf_obj, 'to_dict'):
+            conf = conf_obj.to_dict()
+        elif hasattr(conf_obj, '__dict__'):
+            # Fallback: serialize dict representation
+            conf = {k: v for k, v in conf_obj.__dict__.items() if not k.startswith('_')}
+        else:
+            conf = {"model_name": self.config.model_name, "note": "Config could not be serialized"}
+        
+        with open(path, 'w') as f:
+            json.dump(conf, f, indent=2, default=str)
+        logger.info(f"Saved config to {path}")
+
+    def release_memory(self):
+        logger.info("Releasing memory...")
+        del self.model
+        torch.cuda.empty_cache()
+        gc.collect()
+
+# =============================================================================
+# Quantization Logic
+# =============================================================================
+
+# =============================================================================
+# Quantization Logic
+# =============================================================================
+
+def quantize_all(input_dir: str, output_dir: str):
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load model
-    torch.serialization.add_safe_globals([Namespace])
-    device = "cpu"  # Export on CPU for compatibility
+    # 1. Setup Safe Temp Directory for Quantization
+    # We use a local temp directory on the HDD to avoid filling up the system /tmp (often small/full).
+    safe_temp_dir = os.path.abspath(os.path.join(output_dir, "temp_quant_working"))
+    os.makedirs(safe_temp_dir, exist_ok=True)
     
-    ckpt_fn = os.path.join(model_root, model_name + ".pth")
-    if not os.path.exists(ckpt_fn):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_fn}")
-        
-    logging.info(f"Loading model from {ckpt_fn}")
-    bundle = torch.load(ckpt_fn, map_location=device, weights_only=True)
-    args = bundle["args"]
-    
-    # Import model
-    from models.t5gemma import T5GemmaVoiceModel
-    
-    model = T5GemmaVoiceModel(args)
-    model.load_state_dict(bundle["model"], strict=False)
-    model.to(device)
-    model.eval()
-    
-    del bundle
-    
-    # Export encoder
-    encoder_path = os.path.join(output_dir, "encoder.onnx")
-    export_encoder(model, encoder_path, opset_version)
-    
-    # Export audio codec if requested
-    if export_audio_codec:
-        from data.tokenizer import AudioTokenizer
-        
-        audio_tokenizer = AudioTokenizer(
-            backend="xcodec2",
-            model_name=getattr(args, "xcodec2_model_name", None),
-            device=device,
-        )
-        export_xcodec2(audio_tokenizer, output_dir, opset_version)
-    
-    # Save model args for inference
-    import json
-    
-    args_dict = {}
-    for key in dir(args):
-        if not key.startswith('_'):
-            val = getattr(args, key)
-            if isinstance(val, (int, float, str, bool, list, dict, type(None))):
-                args_dict[key] = val
-    
-    args_path = os.path.join(output_dir, "model_args.json")
-    with open(args_path, 'w') as f:
-        json.dump(args_dict, f, indent=2)
-    logging.info(f"Model args saved to {args_path}")
-    
-    logging.info("=" * 60)
-    logging.info("ONNX export completed!")
-    logging.info(f"Output directory: {output_dir}")
-    logging.info("")
-    logging.info("NOTE: The full decoder export with KV cache is complex and")
-    logging.info("may require additional work. For CPU inference, consider:")
-    logging.info("1. Using PyTorch with torch.set_num_threads() for CPU optimization")
-    logging.info("2. Using torch.compile() for potential speedups")
-    logging.info("3. Using ONNX Runtime with the encoder + custom decoder loop")
-    logging.info("")
-    logging.info("See inference_onnx.py for a hybrid inference example.")
+    # Save original TMPDIR to restore later
+    original_tmpdir = os.environ.get("TMPDIR", None)
+    os.environ["TMPDIR"] = safe_temp_dir
+    logger.info(f"Setting TMPDIR={safe_temp_dir} to avoid No Space Left on Device errors.")
+    logger.info(f"Verified TMPDIR env var: {os.environ['TMPDIR']}")
 
+    # Files to quantize
+    files = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx", "xcodec2_decoder.onnx"]
+    
+    # Copy config
+    src_cfg = os.path.join(input_dir, "model_args.json")
+    if os.path.exists(src_cfg):
+        shutil.copy(src_cfg, os.path.join(output_dir, "model_args.json"))
+    
+    for fname in files:
+        in_path = os.path.join(input_dir, fname)
+        out_path = os.path.join(output_dir, fname.replace(".onnx", ".int8.onnx"))
+        
+        if not os.path.exists(in_path):
+            logger.warning(f"Missing {fname}, skipping quantization.")
+            continue
+        
+        if os.path.exists(out_path):
+             logger.info(f"Target {out_path} already exists. Skipping.")
+             continue
+            
+        logger.info(f"Quantizing {fname} -> {out_path}...")
+        try:
+            # Use quantize_dynamic with memory-saving options
+            quantize_dynamic(
+                model_input=in_path,
+                model_output=out_path,
+                weight_type=QuantType.QUInt8,
+                per_channel=False,  # Reduces memory usage
+                use_external_data_format=True,
+                extra_options={
+                    'DisableShapeInference': True,  # Skip expensive shape inference
+                    'MatMulConstBOnly': True,       # Only quantize MatMul with const B
+                }
+            )
+            logger.info(f"Successfully quantized {fname}")
+        except Exception as e:
+            logger.error(f"Failed to quantize {fname}: {e}")
+        finally:
+            # Force garbage collection to free memory before next file
+            gc.collect()
+            
+    # Cleanup Temp
+    try:
+        if original_tmpdir:
+            os.environ["TMPDIR"] = original_tmpdir
+        else:
+            del os.environ["TMPDIR"]
+        shutil.rmtree(safe_temp_dir)
+        logger.info("Cleaned up temp directory.")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup temp dir: {e}")
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main(model_name="Aratako/T5Gemma-TTS-2b-2b", output_dir="./onnx_models"):
+    # 1. Export (Intermediate FP16)
+    intermediate_dir = f"{output_dir}_fp16"
+    
+    # Check if export is needed
+    # We only need encoder for hybrid inference (decoder uses PyTorch)
+    expected_fp16 = ["encoder.onnx"]  # Only encoder needed for hybrid inference
+    
+    must_export = False
+    for f in expected_fp16:
+        if not os.path.exists(os.path.join(intermediate_dir, f)):
+            must_export = True
+            break
+            
+    if must_export:
+        logger.info("FP16 models missing or incomplete. Starting fresh export...")
+        exporter = T5GemmaExporter(ExportConfig(model_name=model_name, output_dir=intermediate_dir))
+        exporter.load_model()
+        exporter.export_all()
+        exporter.release_memory()
+    else:
+        logger.info(f"All expected FP16 models found in {intermediate_dir}. Skipping Export phase.")
+    
+    # 2. Quantize (Final INT8)
+    int8_dir = f"{output_dir}_int8"
+    logger.info("Starting Quantization...")
+    # quantize_all(intermediate_dir, int8_dir)
+    
+    logger.info("DONE. Final Int8 models in " + int8_dir)
 
 if __name__ == "__main__":
     import fire

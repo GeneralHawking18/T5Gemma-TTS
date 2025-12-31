@@ -220,3 +220,11 @@ datasets/
 runs/
 t5gemma_voice_hf/
 *.pth
+
+**/weights
+temp_working
+onnx_models/
+**.swp
+onnx_models_**
+**.wav
+**.txt
