@@ -1,0 +1,28 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: t5gemma-trt-builder
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: '16gb'  # Increase shared memory for TensorRT build
+    volumes:
+      # Mount the project root to /app so we can access ../trt_weights and other files
+      - ../:/app
+      - ../hf_export:/app/tokenizer_local
+    working_dir: /app/tensorrt_llm_implementation
+    env_file:
+      - ../.env
+    # Default command to build the engine
+    # Adjust arguments as needed
+    command: python3 test_layer0.py
+    environment:
+      - PYTHONPATH=/app:/app/tensorrt_llm_implementation
+      - TRT_LLM_ENABLE_XQA=0  # Disable XQA to reduce memory
+      - TOKENIZER_PATH=/app/tokenizer_local

@@ -6,7 +6,7 @@ Tài liệu này giải thích chi tiết về kiến trúc và quy trình infer
 
 **T5Gemma-TTS** là một mô hình **Autoregressive (AR) Transformer** được xây dựng dựa trên backbone **Gemma 2B** (Google) theo kiến trúc Encoder-Decoder (kiểu T5).
 
-Khác với Style-Bert-VITS2 (sinh song song), T5Gemma-TTS sinh ra các token âm thanh một cách **tuần tự** (token-by-token), cho phép nó nắm bắt ngữ cảnh tốt hơn cho các câu dài và phức tạp, nhưng tốc độ sinh sẽ phụ thuộc vào độ dài câu.
+Khác với Style-Bert-VITS2 (sinh song song), T5Gemma-TTS sinh ra các token âm thanh một cách **tuần tự** (token-by-token), cho phép nó nắm bắt ngữ cảnh tốt hơn cho các câu dài và phức tạp.
 
 Mô hình sử dụng cơ chế **PM-RoPE (Progress-Monitoring Rotary Positional Embeddings)** độc đáo để kiểm soát prosody (ngữ điệu) dựa trên tiến độ câu nói.
 
@@ -41,7 +41,7 @@ graph TD
 
 ## 2. Quy trình Inference Chi Tiết
 
-Quá trình inference được thực hiện qua các bước chính sau (trong hàm `T5GemmaVoiceModel.inference_tts` và `inference_one_sample`):
+Quá trình inference được thực hiện qua các bước chính sau:
 
 ### Bước 1: Text Processing & Encoding
 **Input:** Raw Text ("Xin chào")
@@ -56,7 +56,6 @@ Quá trình inference được thực hiện qua các bước chính sau (trong 
 > **Ví dụ Minh Họa:**
 > *   **Input Text**: "Hello" 
 > *   **Tokens**: `[101, 7592, 102]` (Start, Hello, End). Shape `[1, 3]`.
-> *   **Embedding**: Tensor `[1, 3, 2048]` (2048 là hidden dimension của Gemma 2B).
 > *   **Encoder Output (`memory`)**: Tensor `[1, 3, 2048]`. Đây là "bộ nhớ" chứa ngữ nghĩa câu văn mà Decoder sẽ luôn nhìn vào.
 
 ### Bước 2: Duration Estimation & Decoder Prep
@@ -67,70 +66,75 @@ Mô hình cần biết "đích đến" ở đâu để tính toán tiến độ 
 *   Công thức ước lượng (ví dụ): `len(text) * 5 + len(prompt)`.
 *   Variable `est_total`: Ví dụ ước tính câu nói sẽ dài 150 token âm thanh (frames).
 
-### Bước 3: Autoregressive Generation Loop
+### Bước 3: Autoregressive Generation Loop (Vòng lặp sinh tuần tự)
 **Module:** `Decoder` (`decoder_module`) & `PMCrossAttention`
 
-Đây là vòng lặp chính. Tại mỗi bước $t$:
+Đây là trái tim của mô hình, nơi âm thanh được sinh ra từng đơn vị nhỏ (token) nối tiếp nhau. Quá trình này diễn ra trong một vòng lặp từ bước $t=0$ đến $t=T_{max}$.
 
-1.  **Calculate Position ($pos\_id$)**:
-    *   Tính vị trí hiện tại dựa trên tiến độ hoàn thành.
-    *   Công thức: $pos\_id_t = \frac{t}{\text{est\_total}} \times \text{scale}$
-    *   *Ví dụ:* Tại bước t=75 (một nửa câu), `est_total`=150 $\rightarrow$ $pos\_id \approx 0.5 \times 2000 = 1000$.
-    *   Điều này báo cho mô hình biết: "Chúng ta đang ở giữa câu".
+**1. Khởi tạo (Initialization):**
+*   **Start Token:** Bắt đầu bằng token `<s>` (Start of Sentence).
+*   **KV Cache:** Khởi tạo rỗng để lưu trữ các tính toán quá khứ (Key/Value states), giúp tăng tốc độ inference.
 
-2.  **Decoder Forward**:
-    *   Input: Token âm thanh vừa sinh ra ở bước $t-1$. Shape `[1, 1]`.
-    *   **KV Cache (`past_key_values`)**: Tái sử dụng tính toán của các bước trước $0 \to t-1$, chỉ tính toán cho token mới.
-    *   **Cross Attention**: Decoder (Query) "nhìn" vào Encoder (Key/Value) kết hợp với `PM-RoPE`.
-        *   Query được xoay (rotate) theo $pos\_id$ của Decoder.
-        *   Key của Encoder được xoay theo $pos\_id$ của Encoder.
+**2. Trong mỗi bước lặp (At step $t$):**
+   *   **a. Tính toán Vị trí (Position Calculation):**
+       *   Tính $pos_id_t$ dựa trên tiến độ hoàn thành: $pos_id_t = \frac{t}{\text{est\_total}} \times \text{scale}$.
+       *   Điều này báo cho mô hình biết "chúng ta đang ở đâu trong câu nói" (đầu, giữa, hay cuối) để điều chỉnh ngữ điệu.
+   
+   *   **b. Decoder Forward:**
+       *   Token hiện tại đi qua các lớp Transformer Decoder.
+       *   **Cross Attention:** Decoder "nhìn" vào Encoder Memory. Tại đây, **PM-RoPE** xoay vector query/key để đảm bảo Decoder chỉ chú ý vào các từ ngữ tương ứng với tiến độ thời gian hiện tại.
 
-3.  **Logit Prediction**:
-    *   Output `[1, 1, 2048]` đi qua `predict_layer` (Linear).
-    *   Output Logits: `[1, 1, 65536]` (với Vocab size ~65k của Codec).
+   *   **c. Dự đoán & Lấy mẫu (Predict & Sample):**
+       *   Output đi qua lớp Linear (`predict_layer`) -> Logits (xác suất trên 65,536 từ vựng codec).
+       *   Áp dụng **Top-k, Top-p, Temperature** và **Repetition Penalty** (chống lặp).
+       *   Chọn ra **một** token ID duy nhất cho bước $t$.
 
-4.  **Sampling**:
-    *   **Repetition Penalty**: Nếu mô hình bị lặp (ví dụ cứ sinh im lặng mãi), giảm điểm số của token đó.
-    *   **Top-k / Top-p**: Chỉ lấy xác suất của 30 token cao nhất (Top-k=30) hoặc tổng xác suất 0.9 (Top-p=0.9).
-    *   Chọn ra token tiếp theo: `token_t`.
+   *   **d. Cập nhật (Update):**
+       *   Token mới được thêm vào chuỗi kết quả và trở thành Input cho bước $t+1$.
 
-> **Ví dụ Minh Họa (Bước t=1):**
-> *   **Input**: Start Token `<s>`.
-> *   **Context**: Encoder Memory `[1, 3, 2048]`.
-> *   **Output Logits**: Vector xác suất trên 65k từ vựng.
-> *   **Sampled Token**: `4215` (âm thanh đầu tiên của từ "H").
+**3. Điều kiện dừng:**
+*   Gặp token kết thúc (`EOS`).
+*   Hoặc đạt độ dài tối đa (`max_new_tokens`).
 
-### Bước 4: Completion & Audio Decoding
-Quá trình lặp lại cho đến khi gặp token kết thúc (`EOS`) hoặc đạt giới hạn độ dài.
+### Bước 4: Vocoder Decoding (XCodec2)
+**Module:** `AudioTokenizer` (chứa XCodec2 model)
 
-**Input:** Chuỗi token âm thanh `[4215, 332, 1102, ..., 55]` (Shape: `[1, 150]`).
-**Output:** Waveform Audio.
+Sau khi vòng lặp kết thúc, ta có chuỗi token âm thanh (Discrete Codes). Bước này chuyển đổi chúng thành sóng âm thanh nghe được.
 
-1.  **De-quantization/Decoding**: Chuỗi token được đưa vào **Audio Tokenizer (XCodec2)**.
-2.  **Vocoder**: Biến đổi các vector code này thành sóng âm thanh liên tục (PCM Waveform).
+1.  **Codebook Lookup**: Mỗi token ID được tra cứu trong từ điển (Codebook) để lấy ra vector đặc trưng tương ứng.
+2.  **Decoding**: Mô hình XCodec2 (gồm các lớp Conv1d Transposed và Residual Blocks) giải nén các vector này thành Waveform.
+
+> **Lưu ý quan trọng về XCodec2:**
+> *   Đây là một mô hình độc lập, hoạt động như "cái miệng" (The Mouth).
+> *   Trong quá trình huấn luyện T5Gemma, XCodec2 bị **đóng băng (Frozen)**, không tính gradient. T5Gemma chỉ học cách chọn đúng mã số mà XCodec2 hiểu.
 
 ---
 
-## 3. Các Công Thức Toán Học Chính
+## 3. Cơ chế cốt lõi: PM-RoPE (Progress-Monitoring RoPE)
 
-### 3.1. Progress-Monitoring Position (PM-RoPE)
-Khác với vị trí tuyệt đối (1, 2, 3...), PM-RoPE dùng vị trí tương đối:
+### 3.1. Tại sao cần PM-RoPE? (Vấn đề Alignment)
+Trong các mô hình TTS AR truyền thống, mô hình dễ gặp lỗi:
+- **Lặp từ (Repetition):** Nói mãi một từ không dứt.
+- **Bỏ từ (Skipping):** Nhảy cóc qua nội dung.
+- **Ảo giác (Hallucination):** Sinh âm thanh rác khi mất dấu vị trí.
 
-$$
-\text{pos}(t) = \text{clamp}\left(\frac{t}{T_{est}} \times S, 0, S\right)
-$$
-*   $t$: Số bước hiện tại (current frame index).
-*   $T_{est}$: Tổng độ dài dự kiến (estimated total length).
-*   $S$: Thang đo (`progress_scale`, thường là 2000 hoặc 4000).
+**PM-RoPE** giải quyết bằng cách ép buộc cơ chế Attention tuân theo một "tiến độ" tuyến tính.
 
-### 3.2. Cross Attention with PM-RoPE
-$$
-Attention(Q, K, V) = \text{softmax}\left(\frac{f_{rot}(Q, pos_{dec}) \cdot f_{rot}(K, pos_{enc})^T}{\sqrt{d_k}}\right) V
-$$
-*   $Q$: Query từ Decoder (đang sinh âm thanh).
-*   $K$: Key từ Encoder (văn bản đầu vào).
-*   $f_{rot}$: Hàm xoay Rotary Embedding, nhưng dùng `pos` tính theo tiến độ chứ không phải index.
-*   Điều này giúp cơ chế Attention "khớp" được âm thanh dài với văn bản ngắn một cách linh hoạt.
+### 3.2. Nguyên lý hoạt động
+Khác với vị trí đếm số nguyên (1, 2, 3...), PM-RoPE sử dụng **Vị trí dựa trên tiến độ**:
+
+1.  **Text Position:** Các token văn bản được gán vị trí trải đều trên thang đo $S$.
+2.  **Audio Position:** Tại bước thứ $t$, vị trí không phải là $t$, mà là vị trí quy đổi tương ứng với **% hoàn thành câu nói**.
+
+### 3.3. Công Thức & Minh Họa
+$$ 
+\text{pos}(t) = \text{clamp}\left(\frac{t}{T_{est}} \times S, 0, S\right) 
+$$ 
+
+**Minh họa trực quan:**
+Hãy tưởng tượng thanh trượt nhạc (seek bar) dài 100cm ($S$).
+- Văn bản được rải đều trên thanh thước này.
+- Khi đầu kim chạy đến vạch 50cm (50% thời gian), nó bắt buộc phải đọc chữ cái nằm ở vạch 50cm. Nó không thể đọc chữ ở vạch 10cm (lặp lại) hay 90cm (nhảy cóc) do góc xoay của RoPE sẽ làm triệt tiêu sự chú ý ở các vùng đó.
 
 ---
 
@@ -139,21 +143,19 @@ $$
 | Thành phần | Class/Function (Code) | Vai trò |
 | :--- | :--- | :--- |
 | **Model Wrapper** | `T5GemmaVoiceModel` | Class chính chứa toàn bộ logic. |
-| **Inference Loop** | `inference_tts()` | Hàm thực hiện vòng lặp sinh token tuần tự. |
-| **PM-RoPE Logic** | `_build_position_ids()` | Tính toán tensor vị trí dựa trên tỷ lệ $. |
+| **Inference Loop** | `inference_tts()` | Hàm thực hiện vòng lặp sinh token tuần tự (Bước 3). |
+| **PM-RoPE Logic** | `_build_position_ids()` | Tính toán tensor vị trí dựa trên tỷ lệ. |
 | **Encoder** | `self.encoder_module` | T5Gemma Encoder (xử lý text). |
-| **Decoder Layer** | `PMDecoderLayer` | Layer Decoder được tiêm (inject) PM-RoPE. |
 | **Cross Attention** | `PMCrossAttention` | Nơi thực hiện phép nhân Query-Key với RoPE xoay theo tiến độ. |
-| **Predict Head** | `self.predict_layer` | Linear layer cuối cùng: `Hidden -> Vocab`. |
-| **Sampler** | `sample_helper()` | Logic lấy mẫu (Top-k, Temperature, Penalty). |
+| **Vocoder** | `data/tokenizer.py` | Wrapper gọi model XCodec2 bên ngoài để decode audio. |
 
 ## 5. So sánh với Style-Bert-VITS2 (Non-AR)
 
 | Đặc điểm | T5Gemma-TTS (AR) | Style-Bert-VITS2 (Non-AR) |
 | :--- | :--- | :--- |
 | **Cốt lõi** | Transformer (Decoder-only generation). | VAE + Flow + HiFiGAN. |
-| **Quy trình** | Sinh từng mã token tuần tự ($t_1 \to t_2 \to \dots$). | Sinh toàn bộ spectrogram một lúc. |
+| **Quy trình** | Sinh từng mã token tuần tự. | Sinh toàn bộ spectrogram một lúc. |
 | **Biểu diễn** | Discrete Codes (Token rời rạc, giống từ). | Continuous Spectrogram (Phổ liên tục). |
-| **Duration** | Tự động quyết định khi nào dừng (EOS). | Cần `Duration Predictor` dự đoán trước độ dài mỗi từ. |
-| **Ưu điểm** | - "Hiểu" ngữ cảnh rộng tốt hơn.<br>- Zero-shot cloning cực tốt (chỉ cần nối prompt). | - Tốc độ cực nhanh.<br>- Ổn định, khó bị lặp lại vô tận. |
-| **Nhược điểm** | - Tốc độ chậm hơn (do lặp).<br>- Có thể bị hallucination (nói nhảm) nếu không tune kỹ. | - Khó clone giọng lạ nếu không fine-tune.<br>- Ngữ điệu có thể ít tự nhiên hơn với câu rất dài. |
+| **Vocoder** | Tách rời (XCodec2), frozen khi train. | Tích hợp (HiFiGAN), train cùng lúc (End-to-End). |
+| **Ưu điểm** | "Hiểu" ngữ cảnh rộng, Zero-shot cloning tốt. | Tốc độ cực nhanh, ổn định. |
+| **Nhược điểm** | Tốc độ chậm hơn (do vòng lặp). | Khó clone giọng lạ nếu không fine-tune. |

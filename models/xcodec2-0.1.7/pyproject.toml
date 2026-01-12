@@ -1,0 +1,22 @@
+[project]
+name = "xcodec2"
+version = "0.1.0"
+description = "XCodec2 inference environment"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy<2.0",
+    "einops==0.8.0",
+    "torch==2.6",
+    "torchao>=0.5.0",
+    "torchtune>=0.3.1",
+    "transformers>=4.45.2",
+    "vector-quantize-pytorch==1.17.8",
+    "soundfile>=0.13.1",
+    "torchaudio>=2.6.0",
+    "librosa>=0.11.0",
+    "onnx==1.19.0",
+    "ml-dtypes>=0.4.1",
+    "tensorrt>=10.14.1.48.post1",
+]

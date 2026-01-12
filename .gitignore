@@ -227,4 +227,9 @@ onnx_models/
 **.swp
 onnx_models_**
 **.wav
+
 **.txt
+**.onnx
+**.npy
+**.engine
+**.json

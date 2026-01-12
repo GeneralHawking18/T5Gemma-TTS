@@ -44,3 +44,4 @@ dependencies = [
 
 [tool.uv.sources]
 xcodec2 = { url = "https://huggingface.co/NandemoGHS/Anime-XCodec2-44.1kHz-v2/resolve/main/xcodec2-0.1.7.tar.gz" }
+

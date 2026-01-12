@@ -1,0 +1,1 @@
+docker run --rm --gpus all   -v "$(pwd)":/app   -w /app/tensorrt_llm_implementation   tensorrt_llm_implementation-builder   bash -c "python3 build.py && python3 save_trt_outputs.py"

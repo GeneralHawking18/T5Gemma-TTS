@@ -1,0 +1,20 @@
+FROM nvcr.io/nvidia/tritonserver:25.10-py3
+
+# Install the deprecated cuda-runtime first to satisfy dependency
+RUN pip install --no-cache-dir nvidia-cuda-runtime
+
+# Install torch with CUDA support 
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Install tensorrt bindings only (not full tensorrt package)
+# The container already has TRT libs, we just need Python bindings
+RUN pip install --no-cache-dir tensorrt-cu12-bindings==10.13.3.9 tensorrt-cu12==10.13.3.9 || \
+    pip install --no-cache-dir tensorrt==10.13.3.9 || \
+    echo "Warning: TensorRT install may be incomplete"
+
+# Install other dependencies
+RUN pip install --no-cache-dir transformers numpy scipy
+
+EXPOSE 8000 8001 8002
+
+ENTRYPOINT ["tritonserver", "--model-repository=/models", "--strict-model-config=false"]

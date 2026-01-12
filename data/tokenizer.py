@@ -21,7 +21,8 @@ try:
     from xcodec2.modeling_xcodec2 import XCodec2Model
 
     _HAS_XCODEC2 = True
-except ImportError:
+except ImportError as e:
+    print(f"[DEBUG] xcodec2 import failed: {e}")
     _HAS_XCODEC2 = False
 
 
@@ -62,7 +63,7 @@ class AudioTokenizer:
                 ckpt[k.replace(".beta", ".bias")] = f.get_tensor(k)
             codec_config = BigCodecConfig.from_pretrained(model_id)
             self.codec = XCodec2Model.from_pretrained(
-                None, config=codec_config, state_dict=ckpt
+                None, config=codec_config, state_dict=ckpt, ignore_mismatched_sizes=True
             )
             self.codec.eval()
             self.codec.to(device)
